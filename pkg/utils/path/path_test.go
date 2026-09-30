@@ -431,3 +431,57 @@ func stripNamespace(path string) string {
 	}
 	return strings.Join(pathParts, "/")
 }
+
+// Slashes are legal in an index value. OpenROADM names its hardware that way
+// (circuit-pack-name "1/0/0", interface "ots-1/0/0/E1"), so rejecting them makes
+// those subtrees unconfigurable through gNMI.
+func Test_CheckPathIndexIsValid_AllowsSlash(t *testing.T) {
+	for _, index := range []string{
+		"1/0/0",        // circuit-pack-name
+		"ots-1/0/0/E1", // interface name
+		"eth-1/0/0/OOB",
+		"C1",   // no slash, still fine
+		"eth2", // openconfig style
+		"*",    // wildcard used by AnonymizePathIndices
+	} {
+		assert.NoError(t, CheckPathIndexIsValid(index), "index %q 應被接受", index)
+	}
+}
+
+// Characters that would break path parsing stay rejected.
+func Test_CheckPathIndexIsValid_RejectsPathSyntax(t *testing.T) {
+	for _, index := range []string{
+		"a[b",  // opening bracket
+		"a]b",  // closing bracket ends the index early
+		"a=b",  // separates name from value
+		"a b",  // space
+		"",     // empty
+		"a\tb", // tab
+	} {
+		assert.Error(t, CheckPathIndexIsValid(index), "index %q 應被拒絕", index)
+	}
+}
+
+// A slash inside [key=value] must survive the full string round trip, which is
+// what makes allowing it safe: SplitPath tracks bracket depth, so the slash is
+// never taken for a path separator.
+func Test_SlashInIndex_SurvivesExtraction(t *testing.T) {
+	const p = "/org-openroadm-device/circuit-packs[circuit-pack-name=1/0/0]" +
+		"/ports[port-name=C1]/circuit-id"
+
+	names, values := ExtractIndexNames(p)
+	assert.Equal(t, []string{"circuit-pack-name", "port-name"}, names)
+	assert.Equal(t, []string{"1/0/0", "C1"}, values)
+
+	// Indices are stripped for comparison against model paths; the slashes inside
+	// them must not leave stray segments behind.
+	assert.Equal(t,
+		"/org-openroadm-device/circuit-packs/ports/circuit-id",
+		RemovePathIndices(p))
+
+	assert.Equal(t,
+		"/org-openroadm-device/circuit-packs[circuit-pack-name=*]/ports[port-name=*]/circuit-id",
+		AnonymizePathIndices(p))
+
+	assert.NoError(t, IsPathValid(p))
+}

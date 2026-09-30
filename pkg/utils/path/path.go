@@ -28,7 +28,11 @@ const MatchOnIndex = `(\[.*?]).*?`
 const validPathRegexp = `(/[a-zA-Z0-9:=\-\._[\]]+)+`
 
 // IndexAllowedChars - regexp to restrict characters in index names
-const IndexAllowedChars = `^([a-zA-Z0-9\*\-\._])+$`
+//
+// Forward slash is allowed: OpenROADM names its hardware with slashes
+// (circuit-pack-name "1/0/0", interface "ots-1/0/0/E1"), and rejecting them makes
+// those subtrees unconfigurable through gNMI.
+const IndexAllowedChars = `^([a-zA-Z0-9\*\-\._/])+$`
 
 // ReadOnlySubPathMap abstracts the read only subpath
 type ReadOnlySubPathMap map[string]admin.ReadOnlySubPath
