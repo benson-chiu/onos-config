@@ -59,8 +59,11 @@ func (s *Server) Get(ctx context.Context, req *gnmi.GetRequest) (*gnmi.GetRespon
 		return nil, errors.Status(err).Err()
 	}
 
-	// If the request data type is STATE or OPERATIONAL, get it from the target directly
-	if req.Type == gnmi.GetRequest_STATE || req.Type == gnmi.GetRequest_OPERATIONAL {
+	// If the request data type needs data the target holds, get it from the target directly.
+	// Note ALL is the zero value of GetRequest.DataType, so a request that
+	// omits the type also reaches the target now.
+	if req.Type == gnmi.GetRequest_STATE || req.Type == gnmi.GetRequest_OPERATIONAL ||
+		req.Type == gnmi.GetRequest_ALL {
 		log.Debugf("Process request with data type: %s", req.Type.String())
 		resp, err := s.processStateOrOperationalRequest(ctx, req)
 		if err != nil {
