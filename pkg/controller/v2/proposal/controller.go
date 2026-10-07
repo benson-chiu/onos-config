@@ -413,6 +413,13 @@ func (r *Reconciler) reconcileAbort(ctx context.Context, proposal *configapi.Pro
 		} else if config.Status.Applied.Index == proposal.Status.PrevIndex &&
 			config.Status.Committed.Index >= proposal.TransactionIndex {
 			config.Status.Committed.Index = proposal.TransactionIndex
+			// Advance the applied index too. This proposal is about to be
+			// finalized, so leaving the applied index at PrevIndex blocks every
+			// later proposal forever: reconcileApply waits for Applied.Index to
+			// equal its own PrevIndex, and no further reconcile of this aborted
+			// proposal will ever advance it. reconcileApply takes the same
+			// approach when a gNMI Set fails.
+			config.Status.Applied.Index = proposal.TransactionIndex
 			if err := r.configurations.UpdateStatus(ctx, config); err != nil {
 				log.Warnf("Failed reconciling Transaction %d Proposal to target '%s'", proposal.TransactionIndex, proposal.TargetID, err)
 				return controller.Result{}, err
@@ -531,6 +538,16 @@ func (r *Reconciler) reconcileApply(ctx context.Context, proposal *configapi.Pro
 
 		// If the previous proposal has not yet been applied, wait for it.
 		if proposal.Status.PrevIndex != 0 && config.Status.Applied.Index != proposal.Status.PrevIndex {
+			// A finalized predecessor that never advanced the applied index would
+			// stall this proposal forever, so repair the index rather than wait
+			// for an event that will never arrive.
+			repaired, err := r.repairStalledApplyIndex(ctx, config, proposal)
+			if err != nil {
+				return controller.Result{}, err
+			}
+			if repaired {
+				return controller.Result{}, nil
+			}
 			log.Infof("Transaction %d Proposal to target '%s' waiting for Transaction %d Proposal to be applied", proposal.TransactionIndex, proposal.TargetID, proposal.Status.PrevIndex)
 			return controller.Result{Requeue: controller.NewID(proposalstore.NewID(proposal.TargetID, proposal.Status.PrevIndex))}, nil
 		}
@@ -778,6 +795,60 @@ func (r *Reconciler) updateProposalStatus(ctx context.Context, proposal *configa
 		return nil
 	}
 	return nil
+}
+
+// repairStalledApplyIndex advances the configuration's applied index when the
+// preceding proposal has already reached a terminal state without advancing it.
+func (r *Reconciler) repairStalledApplyIndex(ctx context.Context, config *configapi.Configuration, proposal *configapi.Proposal) (bool, error) {
+	// Only a trailing index can stall this proposal.
+	if config.Status.Applied.Index >= proposal.Status.PrevIndex {
+		return false, nil
+	}
+
+	prevProposal, err := r.proposals.Get(ctx, proposalstore.NewID(proposal.TargetID, proposal.Status.PrevIndex))
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Without the predecessor there is nothing left to wait for.
+			log.Warnf("Advancing applied index for Configuration '%s' to %d: Transaction %d Proposal is missing", config.ID, proposal.Status.PrevIndex, proposal.Status.PrevIndex)
+			return r.advanceAppliedIndex(ctx, config, proposal.Status.PrevIndex)
+		}
+		log.Errorf("Failed fetching Transaction %d Proposal to target '%s'", proposal.Status.PrevIndex, proposal.TargetID, err)
+		return false, err
+	}
+
+	// A predecessor still in flight will advance the index itself.
+	if !isProposalFinalized(prevProposal) {
+		return false, nil
+	}
+
+	log.Warnf("Advancing applied index for Configuration '%s' to %d: Transaction %d Proposal is finalized but left the index behind", config.ID, proposal.Status.PrevIndex, proposal.Status.PrevIndex)
+	return r.advanceAppliedIndex(ctx, config, proposal.Status.PrevIndex)
+}
+
+// advanceAppliedIndex sets the configuration's applied index and persists it.
+func (r *Reconciler) advanceAppliedIndex(ctx context.Context, config *configapi.Configuration, index configapi.Index) (bool, error) {
+	config.Status.Applied.Index = index
+	if err := r.configurations.UpdateStatus(ctx, config); err != nil {
+		log.Warnf("Failed advancing applied index for Configuration '%s'", config.ID, err)
+		return false, err
+	}
+	return true, nil
+}
+
+// isProposalFinalized reports whether the proposal has reached a state from
+// which it will never be reconciled again.
+func isProposalFinalized(proposal *configapi.Proposal) bool {
+	if proposal.Status.Phases.Abort != nil &&
+		proposal.Status.Phases.Abort.State == configapi.ProposalAbortPhase_ABORTED {
+		return true
+	}
+	if proposal.Status.Phases.Apply != nil {
+		switch proposal.Status.Phases.Apply.State {
+		case configapi.ProposalApplyPhase_APPLIED, configapi.ProposalApplyPhase_FAILED:
+			return true
+		}
+	}
+	return false
 }
 
 func getCurrentTimestamp() *time.Time {
