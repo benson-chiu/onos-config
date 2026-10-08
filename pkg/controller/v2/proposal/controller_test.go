@@ -6,6 +6,10 @@ package proposal
 
 import (
 	"context"
+	liberrors "github.com/onosproject/onos-lib-go/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"strings"
 	"testing"
 
 	"github.com/golang/mock/gomock"
@@ -336,5 +340,141 @@ func TestRepairStalledApplyIndex(t *testing.T) {
 			assert.Equal(t, tt.wantAppliedIndex, config.Status.Applied.Index,
 				"applied index")
 		})
+	}
+}
+
+// TestApplyFailureType covers the classification the northbound relies on to
+// turn a failed transaction back into a gRPC status.
+//
+// The inputs go through errors.FromGRPC first, because that is what the
+// southbound client hands to the reconciler. Reading the code with
+// status.Code at that point yields Unknown for every one of them, which is
+// why these are classified with the onos-lib-go predicates instead.
+func TestApplyFailureType(t *testing.T) {
+	tests := []struct {
+		code codes.Code
+		want configapi.Failure_Type
+	}{
+		{codes.InvalidArgument, configapi.Failure_INVALID},
+		{codes.Unavailable, configapi.Failure_UNAVAILABLE},
+		{codes.DeadlineExceeded, configapi.Failure_TIMEOUT},
+		{codes.NotFound, configapi.Failure_NOT_FOUND},
+		{codes.AlreadyExists, configapi.Failure_ALREADY_EXISTS},
+		{codes.PermissionDenied, configapi.Failure_FORBIDDEN},
+		{codes.Unauthenticated, configapi.Failure_UNAUTHORIZED},
+		{codes.FailedPrecondition, configapi.Failure_CONFLICT},
+		{codes.Unimplemented, configapi.Failure_NOT_SUPPORTED},
+		{codes.Internal, configapi.Failure_INTERNAL},
+		{codes.Canceled, configapi.Failure_CANCELED},
+		{codes.Unknown, configapi.Failure_UNKNOWN},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.code.String(), func(t *testing.T) {
+			southbound := liberrors.FromGRPC(status.Error(tt.code, "device said no"))
+
+			// Guard the premise: if this ever starts reporting the original
+			// code, the predicates below are no longer the only way to read it.
+			if got := status.Code(southbound); got == tt.code && tt.code != codes.Unknown {
+				t.Logf("status.Code 現在回得出 %v，可考慮簡化分類", got)
+			}
+
+			if got := applyFailureType(southbound); got != tt.want {
+				t.Errorf("applyFailureType(%v) = %v，預期 %v", tt.code, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyFailureTypeRejectsUnknownOnly makes sure the mapping is not
+// accidentally collapsing everything to one value, which is the bug this
+// replaced.
+func TestApplyFailureTypeRejectsUnknownOnly(t *testing.T) {
+	seen := make(map[configapi.Failure_Type]struct{})
+	for _, code := range []codes.Code{
+		codes.InvalidArgument, codes.Unavailable, codes.DeadlineExceeded,
+		codes.NotFound, codes.Internal,
+	} {
+		seen[applyFailureType(liberrors.FromGRPC(status.Error(code, "x")))] = struct{}{}
+	}
+	if len(seen) != 5 {
+		t.Errorf("五種錯誤只對應到 %d 種 failure type：%v", len(seen), seen)
+	}
+	if _, ok := seen[configapi.Failure_UNKNOWN]; ok {
+		t.Error("已分類的錯誤不該落到 UNKNOWN")
+	}
+}
+
+// TestRecordApplyRetry covers what an application needs while a target is
+// unreachable: the reason has to reach the proposal, and the apply phase has
+// to stay open so the controller keeps retrying.
+func TestRecordApplyRetry(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	proposal := newAbortProposal(106, 105)
+	proposal.Status.Phases.Apply = &configapi.ProposalApplyPhase{
+		State: configapi.ProposalApplyPhase_APPLYING,
+	}
+
+	var writes int
+	proposals := proposalmock.NewMockStore(ctrl)
+	proposals.EXPECT().
+		UpdateStatus(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, updated *configapi.Proposal) error {
+			writes++
+			proposal = updated
+			return nil
+		}).
+		AnyTimes()
+
+	reconciler := &Reconciler{proposals: proposals}
+	cause := liberrors.FromGRPC(status.Error(codes.Unavailable,
+		"與設備的連線失敗: dial tcp 10.0.0.1:830: connect: connection refused"))
+
+	if err := reconciler.recordApplyRetry(context.Background(), proposal, cause); err != nil {
+		t.Fatalf("recordApplyRetry: %v", err)
+	}
+
+	failure := proposal.Status.Phases.Apply.Failure
+	if failure == nil {
+		t.Fatal("重試的原因沒有被記錄")
+	}
+	if failure.Type != configapi.Failure_UNAVAILABLE {
+		t.Errorf("failure type = %v，預期 UNAVAILABLE", failure.Type)
+	}
+	if !strings.HasPrefix(failure.Description, applyRetryPrefix) {
+		t.Errorf("描述少了 %q 前綴，會被誤認為最終失敗：%s",
+			applyRetryPrefix, failure.Description)
+	}
+	if !strings.Contains(failure.Description, "connection refused") {
+		t.Errorf("描述少了設備的原文：%s", failure.Description)
+	}
+
+	// The phase must stay open: ending it here would stop the retry.
+	if got := proposal.Status.Phases.Apply.State; got != configapi.ProposalApplyPhase_APPLYING {
+		t.Errorf("apply phase = %v，預期仍是 APPLYING", got)
+	}
+
+	// Same cause again must not write: a device that stays down would
+	// otherwise emit one store update per retry forever.
+	before := writes
+	if err := reconciler.recordApplyRetry(context.Background(), proposal, cause); err != nil {
+		t.Fatalf("第二次 recordApplyRetry: %v", err)
+	}
+	if writes != before {
+		t.Errorf("原因相同時不該重複寫入，寫了 %d 次", writes-before)
+	}
+
+	// A different cause must write.
+	other := liberrors.FromGRPC(status.Error(codes.DeadlineExceeded, "等設備回應逾時"))
+	if err := reconciler.recordApplyRetry(context.Background(), proposal, other); err != nil {
+		t.Fatalf("換原因後 recordApplyRetry: %v", err)
+	}
+	if writes == before {
+		t.Error("原因改變時應該寫入")
+	}
+	if got := proposal.Status.Phases.Apply.Failure.Type; got != configapi.Failure_TIMEOUT {
+		t.Errorf("換原因後 failure type = %v，預期 TIMEOUT", got)
 	}
 }

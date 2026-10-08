@@ -17,8 +17,6 @@ import (
 	"github.com/onosproject/onos-config/pkg/utils/v2/tree"
 	utilsv2 "github.com/onosproject/onos-config/pkg/utils/v2/values"
 	"github.com/openconfig/gnmi/proto/gnmi_ext"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/onosproject/onos-config/pkg/pluginregistry"
 
@@ -34,6 +32,11 @@ import (
 )
 
 var log = logging.GetLogger("controller", "proposal")
+
+// applyRetryPrefix marks a failure that is being retried rather than final.
+// Callers inspecting a transaction in APPLYING can use it to tell the two
+// apart; the northbound only converts failures on a FAILED transaction.
+const applyRetryPrefix = "retrying: "
 
 const (
 	defaultTimeout = 30 * time.Second
@@ -682,45 +685,34 @@ func (r *Reconciler) reconcileApply(ctx context.Context, proposal *configapi.Pro
 		log.Debugf("Sending SetRequest %+v", setRequest)
 		setResponse, err := conn.Set(ctx, setRequest)
 		if err != nil {
-			code := status.Code(err)
-			switch code {
-			case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-				log.Errorf("Failed sending SetRequest %+v", setRequest, err)
+			// Classify with the onos-lib-go predicates, not status.Code.
+			//
+			// The southbound client converts every gRPC error through
+			// errors.FromGRPC (southbound/gnmi/client.go), which returns a
+			// *errors.TypedError. That type has no GRPCStatus() method, so
+			// status.Code reports Unknown for every one of them, and all errors
+			// used to fall through to the default branch below: a target that was
+			// merely unreachable got marked FAILED instead of being retried, and
+			// the recorded failure type was always UNKNOWN.
+			switch {
+			case errors.IsUnavailable(err), errors.IsCanceled(err), errors.IsTimeout(err):
+				// Worth another attempt, so leave the apply phase open and let the
+				// controller retry with backoff. Record the reason first: the phase
+				// stays APPLYING, so without this the only trace of an ongoing
+				// retry is this process's log, which an application cannot read.
+				log.Warnf("Retrying SetRequest to target '%s': %s", proposal.TargetID, err.Error())
+				if recordErr := r.recordApplyRetry(ctx, proposal, err); recordErr != nil {
+					return controller.Result{}, recordErr
+				}
 				return controller.Result{}, err
-			case codes.PermissionDenied:
+			case errors.IsForbidden(err):
 				// The gNMI Set request can be denied if this master has been superseded by a master in a later term.
 				// Rather than reverting to the STALE state now, wait for this node to see the mastership state change
 				// to avoid flapping between states while the system converges.
 				log.Warnf("Configuration '%s' mastership superseded for term %d", config.ID, config.Status.Mastership.Term)
 				return controller.Result{}, nil
 			default:
-				var failureType configapi.Failure_Type
-				switch code {
-				case codes.Unknown:
-					failureType = configapi.Failure_UNKNOWN
-				case codes.Canceled:
-					failureType = configapi.Failure_CANCELED
-				case codes.NotFound:
-					failureType = configapi.Failure_NOT_FOUND
-				case codes.AlreadyExists:
-					failureType = configapi.Failure_ALREADY_EXISTS
-				case codes.Unauthenticated:
-					failureType = configapi.Failure_UNAUTHORIZED
-				case codes.PermissionDenied:
-					failureType = configapi.Failure_FORBIDDEN
-				case codes.FailedPrecondition:
-					failureType = configapi.Failure_CONFLICT
-				case codes.InvalidArgument:
-					failureType = configapi.Failure_INVALID
-				case codes.Unavailable:
-					failureType = configapi.Failure_UNAVAILABLE
-				case codes.Unimplemented:
-					failureType = configapi.Failure_NOT_SUPPORTED
-				case codes.DeadlineExceeded:
-					failureType = configapi.Failure_TIMEOUT
-				case codes.Internal:
-					failureType = configapi.Failure_INTERNAL
-				}
+				failureType := applyFailureType(err)
 
 				// Update the Configuration's applied index to indicate this Proposal was applied even though it failed.
 				log.Infof("Updating applied index for Configuration '%s' to %d in term %d", config.ID, proposal.TransactionIndex, config.Status.Mastership.Term)
@@ -849,6 +841,73 @@ func isProposalFinalized(proposal *configapi.Proposal) bool {
 		}
 	}
 	return false
+}
+
+// applyFailureType maps a southbound error to the failure type recorded on the
+// proposal, which the northbound turns back into a gRPC status for the caller.
+//
+// The predicates come from onos-lib-go because that is what the southbound
+// client produced: it ran the gRPC error through errors.FromGRPC, so the
+// original code is only recoverable through these.
+func applyFailureType(err error) configapi.Failure_Type {
+	switch {
+	case errors.IsCanceled(err):
+		return configapi.Failure_CANCELED
+	case errors.IsNotFound(err):
+		return configapi.Failure_NOT_FOUND
+	case errors.IsAlreadyExists(err):
+		return configapi.Failure_ALREADY_EXISTS
+	case errors.IsUnauthorized(err):
+		return configapi.Failure_UNAUTHORIZED
+	case errors.IsForbidden(err):
+		return configapi.Failure_FORBIDDEN
+	case errors.IsConflict(err):
+		return configapi.Failure_CONFLICT
+	case errors.IsInvalid(err):
+		return configapi.Failure_INVALID
+	case errors.IsUnavailable(err):
+		return configapi.Failure_UNAVAILABLE
+	case errors.IsNotSupported(err):
+		return configapi.Failure_NOT_SUPPORTED
+	case errors.IsTimeout(err):
+		return configapi.Failure_TIMEOUT
+	case errors.IsInternal(err):
+		return configapi.Failure_INTERNAL
+	default:
+		return configapi.Failure_UNKNOWN
+	}
+}
+
+// recordApplyRetry notes why the apply is being retried, leaving the phase in
+// APPLYING so the controller keeps trying.
+//
+// A retry is otherwise invisible outside this process: the transaction stays in
+// APPLYING with no failure attached, so an application waiting on its Set has
+// no way to tell "still working on it" from "stuck on an unreachable device".
+// The transaction controller copies this onto the transaction, where
+// WatchTransactions and the admin API can see it.
+//
+// The description is prefixed so nobody mistakes it for a terminal failure.
+func (r *Reconciler) recordApplyRetry(ctx context.Context, proposal *configapi.Proposal, cause error) error {
+	failure := &configapi.Failure{
+		Type:        applyFailureType(cause),
+		Description: fmt.Sprintf("%s%s", applyRetryPrefix, cause.Error()),
+	}
+
+	// Avoid a store write (and the event it generates) when the reason has not
+	// changed: a device that stays down would otherwise produce one update per
+	// retry forever.
+	if current := proposal.Status.Phases.Apply.Failure; current != nil &&
+		current.Type == failure.Type && current.Description == failure.Description {
+		return nil
+	}
+
+	proposal.Status.Phases.Apply.Failure = failure
+	if err := r.updateProposalStatus(ctx, proposal); err != nil {
+		log.Warnf("Failed recording retry cause for Transaction %d Proposal to target '%s'", proposal.TransactionIndex, proposal.TargetID, err)
+		return err
+	}
+	return nil
 }
 
 func getCurrentTimestamp() *time.Time {

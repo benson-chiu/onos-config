@@ -6,6 +6,8 @@ package transaction
 
 import (
 	"context"
+
+	"github.com/gogo/protobuf/proto"
 	"time"
 
 	proposalstore "github.com/onosproject/onos-config/pkg/store/v2/proposal"
@@ -601,6 +603,19 @@ func (r *Reconciler) reconcileApply(ctx context.Context, transaction *configapi.
 			switch proposal.Status.Phases.Apply.State {
 			case configapi.ProposalApplyPhase_APPLYING:
 				allApplied = false
+				// Surface why an apply is being retried. The proposal keeps this
+				// phase while the controller retries an unreachable target, so
+				// without copying the reason here a client watching the transaction
+				// sees APPLYING and nothing more. The state stays APPLYING, so this
+				// cannot be mistaken for a terminal failure.
+				if failure := proposal.Status.Phases.Apply.Failure; failure != nil &&
+					!proto.Equal(failure, transaction.Status.Phases.Apply.Failure) {
+					transaction.Status.Phases.Apply.Failure = failure
+					transaction.Status.Failure = failure
+					if err := r.updateTransactionStatus(ctx, transaction); err != nil {
+						return controller.Result{}, err
+					}
+				}
 			case configapi.ProposalApplyPhase_FAILED:
 				log.Warnf("Transaction %d apply failed", transaction.Index)
 				transaction.Status.State = configapi.TransactionStatus_FAILED
