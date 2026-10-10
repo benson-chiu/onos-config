@@ -28,6 +28,7 @@ import (
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/util/metautils"
 	"github.com/onosproject/onos-config/pkg/utils"
+	pathutils "github.com/onosproject/onos-config/pkg/utils/path"
 	"github.com/openconfig/gnmi/proto/gnmi"
 )
 
@@ -121,10 +122,30 @@ func (s *Server) processRequest(ctx context.Context, req *gnmi.GetRequest, group
 			pathAsString = utils.StrPath(prefix) + pathAsString
 		}
 		pathAsString = strings.TrimSuffix(pathAsString, "/")
+
+		// Resolve the path against the model before using it.
+		//
+		// Without this the path is only ever matched against the values
+		// already in the store, so one that cannot exist — a typo, or the
+		// module-prefixed form a device vendor publishes — comes back as a
+		// successful response with no value. That is indistinguishable from
+		// "the target has nothing at this path", and sends the caller
+		// looking at the device for a fault in their own request.
+		//
+		// Resolution also accepts the prefixed form by retrying without the
+		// prefixes, so those paths work as written.
+		resolved, err := s.resolvePath(pathAsString, targets[targetID])
+		if err != nil {
+			log.Warnf("Get path '%s' for target '%s': %s", pathAsString, targetID, err.Error())
+			// Returned bare: Get wraps it once with errors.Status, and
+			// wrapping here as well turns NotFound into Internal.
+			return nil, err
+		}
+
 		paths = append(paths, &pathInfo{
 			targetID:     targetID,
 			path:         path,
-			pathAsString: pathAsString,
+			pathAsString: resolved,
 		})
 	}
 
@@ -268,6 +289,29 @@ func (s *Server) processRequest(ctx context.Context, req *gnmi.GetRequest, group
 	return &response, nil
 }
 
+// resolvePath checks a requested path against the target's model and returns
+// the form that matches it.
+//
+// A target whose plugin is unknown is left alone: refusing the request would
+// be a regression for anything that worked before the model was available,
+// and the store lookup that follows is harmless either way.
+func (s *Server) resolvePath(pathAsString string, target *targetInfo) (string, error) {
+	if target == nil || target.plugin == nil {
+		return pathAsString, nil
+	}
+	info := target.plugin.GetInfo()
+	if info == nil || (len(info.ReadWritePaths) == 0 && len(info.ReadOnlyPaths) == 0) {
+		return pathAsString, nil
+	}
+
+	resolved, found := pathutils.ResolveModelPath(pathAsString, info.ReadWritePaths, info.ReadOnlyPaths)
+	if !found {
+		return "", errors.NewNotFound("path '%s' is not in model %s/%s",
+			pathAsString, info.Info.Name, info.Info.Version)
+	}
+	return resolved, nil
+}
+
 func (s *Server) processStateOrOperationalRequest(ctx context.Context, req *gnmi.GetRequest) (*gnmi.GetResponse, error) {
 	prefix := req.GetPrefix()
 	paths := make(map[configapi.TargetID][]*gnmi.Path)
@@ -280,14 +324,12 @@ func (s *Server) processStateOrOperationalRequest(ctx context.Context, req *gnmi
 		if targetID == "" {
 			return nil, errors.NewInvalid("has no target")
 		}
-		if pathList, ok := paths[targetID]; ok {
-			pathList = append(pathList, path)
-			paths[targetID] = pathList
-		} else {
-			var pathList []*gnmi.Path
-			pathList = append(pathList, path)
-			paths[targetID] = pathList
-		}
+		// Normalise before forwarding. The southbound sees schema names,
+		// so a module-prefixed path would reach the device adapter as an
+		// element it has no node for and come back NotFound.
+		path = s.normalizeGnmiPath(ctx, targetID, path, prefix)
+
+		paths[targetID] = append(paths[targetID], path)
 	}
 
 	for targetID, paths := range paths {
@@ -319,6 +361,64 @@ func (s *Server) processStateOrOperationalRequest(ctx context.Context, req *gnmi
 
 }
 
+// normalizeGnmiPath strips RFC 7951 module prefixes from a path bound for the
+// southbound, so a caller may use the prefixed form a device vendor
+// publishes.
+//
+// The southbound addresses nodes by schema name, so a prefixed path fails
+// there no matter what — stripping cannot make a working request fail. The
+// model is still consulted first, in case it genuinely holds a path whose
+// element name contains a colon; only when it does not is the prefix removed.
+//
+// Validation is deliberately left to the southbound: it knows its own schema,
+// including the choice/case nodes that do not appear in the model's read-only
+// path map (alarm resources are one), and rejecting here would refuse paths
+// that work.
+func (s *Server) normalizeGnmiPath(ctx context.Context, targetID configapi.TargetID, path, prefix *gnmi.Path) *gnmi.Path {
+	if path == nil || !pathHasModulePrefix(path) {
+		return path
+	}
+
+	// Keep the path as written if the model recognises it that way.
+	targets := make(map[configapi.TargetID]*targetInfo)
+	if err := s.addTarget(ctx, targetID, targets, nil); err == nil {
+		if target := targets[targetID]; target != nil && target.plugin != nil {
+			if info := target.plugin.GetInfo(); info != nil {
+				pathAsString := utils.StrPath(path)
+				if prefix != nil && prefix.Elem != nil {
+					pathAsString = utils.StrPath(prefix) + pathAsString
+				}
+				pathAsString = strings.TrimSuffix(pathAsString, "/")
+				if resolved, found := pathutils.ResolveModelPath(pathAsString,
+					info.ReadWritePaths, info.ReadOnlyPaths); found && resolved == pathAsString {
+					return path
+				}
+			}
+		}
+	}
+
+	stripped := &gnmi.Path{Target: path.Target, Origin: path.Origin}
+	for _, elem := range path.Elem {
+		name := elem.Name
+		if i := strings.IndexByte(name, ':'); i >= 0 {
+			name = name[i+1:]
+		}
+		stripped.Elem = append(stripped.Elem, &gnmi.PathElem{Name: name, Key: elem.Key})
+	}
+	return stripped
+}
+
+// pathHasModulePrefix reports whether any element name carries a "module:"
+// prefix, so the common case costs nothing.
+func pathHasModulePrefix(path *gnmi.Path) bool {
+	for _, elem := range path.GetElem() {
+		if strings.Contains(elem.GetName(), ":") {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) addTarget(ctx context.Context, targetID configapi.TargetID, targets map[configapi.TargetID]*targetInfo,
 	overrides map[string]*configapi.TargetTypeVersion) error {
 	configurable, err := s.getTargetConfigurable(ctx, topoapi.ID(targetID))
@@ -348,6 +448,10 @@ func (s *Server) addTarget(ctx context.Context, targetID configapi.TargetID, tar
 		targetVersion: configapi.TargetVersion(modelPlugin.GetInfo().Info.Version),
 		targetType:    configapi.TargetType(modelPlugin.GetInfo().Info.Name),
 		persistent:    configurable.Persistent,
+		// The plugin was looked up above but never kept, so nothing on the
+		// Get path could consult the model — which is why an unresolvable
+		// path produced an empty response instead of NotFound.
+		plugin: modelPlugin,
 	}
 
 	targetConfig, err := s.configurations.Get(ctx, configuration.NewID(targetInfo.targetID, targetInfo.targetType, targetInfo.targetVersion))

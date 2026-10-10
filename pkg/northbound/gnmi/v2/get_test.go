@@ -223,7 +223,7 @@ func Test_BasicGet(t *testing.T) {
 	request := gnmi.GetRequest{
 		Path:     []*gnmi.Path{targetPath(t, targetID, "foo")},
 		Encoding: gnmi.Encoding_JSON,
-		Type: gnmi.GetRequest_CONFIG,
+		Type:     gnmi.GetRequest_CONFIG,
 	}
 
 	result, err := test.server.Get(context.TODO(), &request)
@@ -268,7 +268,7 @@ func Test_BasicGetUpdateWithOverride(t *testing.T) {
 		Path:      []*gnmi.Path{targetPath(t, targetID, "foo")},
 		Encoding:  gnmi.Encoding_JSON,
 		Extension: []*gnmi_ext.Extension{tvoext},
-		Type: gnmi.GetRequest_CONFIG,
+		Type:      gnmi.GetRequest_CONFIG,
 	}
 
 	result, err := test.server.Get(context.TODO(), &request)
@@ -309,7 +309,7 @@ func Test_GetWithPrefixOnly(t *testing.T) {
 		Prefix:   targetPath(t, targetID, "foo"),
 		Path:     []*gnmi.Path{},
 		Encoding: gnmi.Encoding_JSON,
-		Type: gnmi.GetRequest_CONFIG,
+		Type:     gnmi.GetRequest_CONFIG,
 	}
 
 	result, err := test.server.Get(context.TODO(), &request)

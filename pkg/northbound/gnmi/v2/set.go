@@ -315,12 +315,39 @@ func (s *Server) getTargetConfigurable(ctx context.Context, targetID topoapi.ID)
 
 // This deals with either a path and a value (simple case) or a path with
 // a JSON body which implies multiple paths and values.
+// normalizeModelPath rewrites a path into the form the model uses.
+//
+// Only the module prefixes differ, and only when the caller supplied them;
+// anything that does not resolve is returned unchanged so the validation that
+// follows reports it rather than this silently altering the request.
+func normalizeModelPath(path string, target *targetInfo) string {
+	if target == nil || target.plugin == nil {
+		return path
+	}
+	info := target.plugin.GetInfo()
+	if info == nil {
+		return path
+	}
+	resolved, found := pathutils.ResolveModelPath(path, info.ReadWritePaths, info.ReadOnlyPaths)
+	if !found {
+		return path
+	}
+	return resolved
+}
+
 func (s *Server) doUpdateOrReplace(ctx context.Context, prefix *gnmi.Path, u *gnmi.Update, target *targetInfo) error {
 	prefixPath := utils.StrPath(prefix)
 	path := utils.StrPath(u.Path)
 	if prefixPath != "/" {
 		path = fmt.Sprintf("%s%s", prefixPath, path)
 	}
+	// Store the model's own spelling of the path, not the caller's.
+	//
+	// A module-prefixed path now passes validation, but the prefix must not
+	// survive into the stored configuration: that is what gets pushed south,
+	// and a device has no node by that name. Normalising here keeps the
+	// stored intent in one form regardless of how it was asked for.
+	path = normalizeModelPath(path, target)
 
 	jsonVal := u.GetVal().GetJsonVal()
 	if jsonVal != nil {
@@ -361,6 +388,7 @@ func (s *Server) doDelete(prefix *gnmi.Path, gnmiPath *gnmi.Path, target *target
 	if prefixPath != "/" {
 		path = fmt.Sprintf("%s%s", prefixPath, path)
 	}
+	path = normalizeModelPath(path, target)
 	// Checks for read only paths
 	isExactMatch, rwPath, err := pathutils.FindPathFromModel(path, target.plugin.GetInfo().ReadWritePaths, false)
 	if err != nil {

@@ -210,7 +210,7 @@ func validateNestedPath(t *testing.T, targetID configapi.TargetID, test *testCon
 	request := gnmi.GetRequest{
 		Path:     []*gnmi.Path{targetPath(t, targetID, "some", "nested", "path")},
 		Encoding: gnmi.Encoding_JSON,
-		Type: gnmi.GetRequest_CONFIG,
+		Type:     gnmi.GetRequest_CONFIG,
 	}
 
 	result, err := test.server.Get(context.TODO(), &request)
