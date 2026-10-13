@@ -187,3 +187,65 @@ func TestResolveModelPathWildcardSubPaths(t *testing.T) {
 		ReadWritePathMap{}, roPaths)
 	assert.False(t, found)
 }
+
+// TestGetParentPathKeepsSlashesInKeys covers the OpenROADM naming scheme, where
+// list keys contain slashes. Walking the ancestors of such a path used to
+// produce elements that do not exist, so tombstones in the configuration store
+// were never found and deleted entries kept shadowing their replacements.
+func TestGetParentPathKeepsSlashesInKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want []string // successive ancestors, outermost last
+	}{
+		{
+			name: "plain key",
+			path: "/org-openroadm-device/interface[name=nmc-ctp-ch-1]/type",
+			want: []string{
+				"/org-openroadm-device/interface[name=nmc-ctp-ch-1]",
+				"/org-openroadm-device",
+			},
+		},
+		{
+			name: "key with slashes",
+			path: "/org-openroadm-device/interface[name=ots-1/0/0/E1]/type",
+			want: []string{
+				"/org-openroadm-device/interface[name=ots-1/0/0/E1]",
+				"/org-openroadm-device",
+			},
+		},
+		{
+			name: "nested container under key with slashes",
+			path: "/org-openroadm-device/interface[name=ots-1/0/0/E1]/nmc-ctp/frequency",
+			want: []string{
+				"/org-openroadm-device/interface[name=ots-1/0/0/E1]/nmc-ctp",
+				"/org-openroadm-device/interface[name=ots-1/0/0/E1]",
+				"/org-openroadm-device",
+			},
+		},
+		{
+			name: "two keys, both with slashes",
+			path: "/org-openroadm-device/circuit-packs[circuit-pack-name=1/0/0]/ports[port-name=E1]/port-name",
+			want: []string{
+				"/org-openroadm-device/circuit-packs[circuit-pack-name=1/0/0]/ports[port-name=E1]",
+				"/org-openroadm-device/circuit-packs[circuit-pack-name=1/0/0]",
+				"/org-openroadm-device",
+			},
+		},
+		{
+			name: "top level element has no parent",
+			path: "/org-openroadm-device",
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for p := GetParentPath(tt.path); p != ""; p = GetParentPath(p) {
+				got = append(got, p)
+			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

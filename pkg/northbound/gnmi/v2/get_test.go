@@ -78,7 +78,7 @@ func createServer(t *testing.T) *testContext {
 
 func (test *testContext) startControllers(t *testing.T) {
 	test.conns = sb.NewConnManager()
-	test.configurationController = configurationcontroller.NewController(test.topo, test.conns, test.server.configurations)
+	test.configurationController = configurationcontroller.NewController(test.topo, test.conns, test.server.configurations, test.server.proposals)
 	assert.NoError(t, test.configurationController.Start())
 
 	test.proposalController = proposalcontroller.NewController(test.topo, test.conns, test.server.proposals, test.server.configurations, test.registry)

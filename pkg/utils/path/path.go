@@ -210,12 +210,32 @@ func IsPathValid(path string) error {
 }
 
 // GetParentPath returns the immediate parent path of the specified path; empty string if "/" is given
+//
+// Slashes inside list key predicates are not separators. OpenROADM names its
+// hardware with slashes, so interface[name=ots-1/0/0/E1] is one element and
+// splitting on the last slash would walk into paths that do not exist. Callers
+// use this to find ancestors in the configuration store, where a wrong parent
+// silently fails to match instead of reporting an error.
 func GetParentPath(path string) string {
-	i := strings.LastIndex(path, "/")
-	if i <= 0 {
+	depth, last := 0, -1
+	for i, r := range path {
+		switch r {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		case '/':
+			if depth == 0 {
+				last = i
+			}
+		}
+	}
+	if last <= 0 {
 		return ""
 	}
-	return path[0:i]
+	return path[0:last]
 }
 
 // StripModulePrefixes removes RFC 7951 module prefixes from a path's element

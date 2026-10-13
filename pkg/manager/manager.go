@@ -139,8 +139,8 @@ func (m *Manager) startMastershipController(topo topo.Store, configurations conf
 	return mastershipController.Start()
 }
 
-func (m *Manager) startConfigurationController(topo topo.Store, conns sb.ConnManager, configurations configuration.Store) error {
-	configurationController := configurationcontroller.NewController(topo, conns, configurations)
+func (m *Manager) startConfigurationController(topo topo.Store, conns sb.ConnManager, configurations configuration.Store, proposals proposal.Store) error {
+	configurationController := configurationcontroller.NewController(topo, conns, configurations, proposals)
 	return configurationController.Start()
 }
 
@@ -207,7 +207,7 @@ func (m *Manager) Start() error {
 		return err
 	}
 
-	err = m.startConfigurationController(topoStore, conns, configurations)
+	err = m.startConfigurationController(topoStore, conns, configurations, proposals)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ package proposal
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -452,6 +453,19 @@ func (r *Reconciler) reconcileCommit(ctx context.Context, proposal *configapi.Pr
 			return controller.Result{}, nil
 		}
 
+		// The configuration must be committed at exactly the preceding index.
+		// Committing out of order would drop this proposal's values: the store
+		// write below is the only place they reach the configuration, and the
+		// proposal is marked COMMITTED either way. Requeue the predecessor so
+		// the chain advances instead of leaving the store behind the device.
+		if proposal.Status.PrevIndex != 0 && config.Status.Committed.Index != proposal.Status.PrevIndex {
+			log.Warnf("Deferring commit of Transaction %d Proposal to target '%s': Configuration committed at index %d, expected %d",
+				proposal.TransactionIndex, proposal.TargetID, config.Status.Committed.Index, proposal.Status.PrevIndex)
+			return controller.Result{
+				Requeue: controller.NewID(proposalstore.NewID(proposal.TargetID, proposal.Status.PrevIndex)),
+			}, nil
+		}
+
 		if config.Status.Committed.Index == proposal.Status.PrevIndex {
 			var changeValues map[string]*configapi.PathValue
 			switch details := proposal.Details.(type) {
@@ -467,8 +481,8 @@ func (r *Reconciler) reconcileCommit(ctx context.Context, proposal *configapi.Pr
 				config.Values = make(map[string]*configapi.PathValue)
 			}
 			updatedChangeValues := controllerutils.AddDeleteChildren(proposal.TransactionIndex, changeValues, config.Values)
-			for path, updatedChangeValue := range updatedChangeValues {
-				_, _ = applyChangeToConfig(config.Values, path, updatedChangeValue)
+			for _, path := range sortedPaths(updatedChangeValues) {
+				_, _ = applyChangeToConfig(config.Values, path, updatedChangeValues[path])
 			}
 			config.Status.Committed.Index = proposal.TransactionIndex
 			err = r.configurations.Update(ctx, config)
@@ -476,6 +490,11 @@ func (r *Reconciler) reconcileCommit(ctx context.Context, proposal *configapi.Pr
 				log.Warnf("Failed reconciling Transaction %d Proposal to target '%s'", proposal.TransactionIndex, proposal.TargetID, err)
 				return controller.Result{}, err
 			}
+		} else {
+			// PrevIndex is 0 here, so there is no predecessor to requeue. A
+			// mismatch means the configuration moved on without this proposal.
+			log.Warnf("Skipping commit of Transaction %d Proposal to target '%s': Configuration committed at index %d, expected %d",
+				proposal.TransactionIndex, proposal.TargetID, config.Status.Committed.Index, proposal.Status.PrevIndex)
 		}
 
 		log.Infof("Committed Proposal '%s'", proposal.ID)
@@ -497,14 +516,39 @@ func (r *Reconciler) reconcileCommit(ctx context.Context, proposal *configapi.Pr
 	}
 }
 
+// sortedPaths returns the keys of values in lexical order.
+//
+// applyChangeToConfig mutates the map it is given: writing a path removes any
+// ancestor marked deleted. Order therefore decides the result when one change
+// carries both a tombstone and the paths replacing it. Lexical order puts
+// ancestors first, so the tombstone is written and then cleared by its
+// children, which is the intended outcome. Go's randomised map order would
+// sometimes do the reverse and leave the tombstone shadowing the new values.
+func sortedPaths(values map[string]*configapi.PathValue) []string {
+	paths := make([]string, 0, len(values))
+	for path := range values {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 func applyChangeToConfig(values map[string]*configapi.PathValue, path string, value *configapi.PathValue) (string, *configapi.PathValue) {
 	values[path] = value
 
-	// Walk up the path and make sure that there are no parents marked as deleted in the given map, if so, remove them
+	// Walk up the path and drop any parent marked as deleted, so the tombstone
+	// stops shadowing the value just written.
+	//
+	// Known limitation: the store layer persists only the paths present in
+	// this map, so the removal does not reach the backing store and the
+	// tombstone is reloaded on the next read, pruning the values written here.
+	// Clearing the flag in place instead would make it durable but produces a
+	// PathValue addressing a non-leaf node with an empty value, which the
+	// southbound rejects. Removing a tombstone needs support in the store
+	// layer; see sortedPaths for the part that is fixed here.
 	parent := pathutils.GetParentPath(path)
 	for parent != "" {
 		if v := values[parent]; v != nil && v.Deleted {
-			// Delete the parent marked as deleted and return its path and value
 			delete(values, parent)
 			return parent, v
 		}
